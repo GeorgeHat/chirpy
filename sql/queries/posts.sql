@@ -8,3 +8,11 @@ VALUES (
     $2
 )
 RETURNING *;
+
+-- name: GetAllPosts :many
+SELECT * FROM posts
+ORDER BY created_at ASC;
+
+-- name: GetPostById :one
+SELECT * FROM posts
+WHERE id = $1;

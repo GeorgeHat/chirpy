@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/GeorgeHat/chirpy/internal/auth"
 	"github.com/GeorgeHat/chirpy/internal/database"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -35,8 +36,11 @@ func main() {
 	serveMux.HandleFunc("GET /api/healthz", healthzHandlerFunc)
 	serveMux.HandleFunc("GET /admin/metrics", cfg.getMetricsHandler)
 	serveMux.HandleFunc("POST /admin/reset", cfg.resetHandler)
+	serveMux.HandleFunc("GET /api/chirps", cfg.getChirpsHandler)
+	serveMux.HandleFunc("GET /api/chirps/{id}", cfg.getChirpHandler)
 	serveMux.HandleFunc("POST /api/chirps", cfg.createChirpHandler)
 	serveMux.HandleFunc("POST /api/users", cfg.createUserHandler)
+	serveMux.HandleFunc("POST /api/login", cfg.loginHandler)
 	server := new(http.Server)
 	server.Addr = ":8080"
 	server.Handler = serveMux
@@ -54,6 +58,14 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+}
+
+type Post struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserID    uuid.UUID `json:"user_id"`
 }
 
 func healthzHandlerFunc(w http.ResponseWriter, r *http.Request) {
@@ -88,8 +100,10 @@ func (cfg *apiConfig) resetHandler(w http.ResponseWriter, r *http.Request) {
 		err := cfg.db.DeleteAllUsers(r.Context())
 		if err != nil {
 			respondWithError(w, 500, "Error deleting users")
+			return
 		}
 		w.WriteHeader(200)
+
 	} else {
 		w.WriteHeader(403)
 	}
@@ -122,13 +136,6 @@ func (cfg *apiConfig) createChirpHandler(w http.ResponseWriter, r *http.Request)
 		fmt.Println("Error decoding request json body")
 		return
 	}
-	type responseParams struct {
-		ID        uuid.UUID `json:"id"`
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
-		Body      string    `json:"body"`
-		UserID    uuid.UUID `json:"user_id"`
-	}
 
 	if !validateChirp(params.Body) {
 		respondWithError(w, 400, "Chirp is too long")
@@ -138,8 +145,9 @@ func (cfg *apiConfig) createChirpHandler(w http.ResponseWriter, r *http.Request)
 	post, err := cfg.db.CreatePost(r.Context(), database.CreatePostParams{Body: params.Body, UserID: params.UserID})
 	if err != nil {
 		respondWithError(w, 500, "Error creating post")
+		return
 	}
-	response := responseParams{
+	response := Post{
 		ID:        post.ID,
 		CreatedAt: post.CreatedAt,
 		UpdatedAt: post.UpdatedAt,
@@ -164,18 +172,27 @@ func censorInput(input string) string {
 
 func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) {
 	type requestParams struct {
-		Email string `json:"email"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 	decoder := json.NewDecoder(r.Body)
 	params := &requestParams{}
 	err := decoder.Decode(params)
 	if err != nil {
 		respondWithError(w, 500, "Error decoding json")
+		return
 	}
 
-	user, err := cfg.db.CreateUser(r.Context(), params.Email)
+	hash, err := auth.HashPassword(params.Password)
+	if err != nil {
+		respondWithError(w, 500, err.Error())
+		return
+	}
+
+	user, err := cfg.db.CreateUser(r.Context(), database.CreateUserParams{Email: params.Email, HashedPassword: hash})
 	if err != nil {
 		respondWithError(w, 500, "Error creating user")
+		return
 	}
 	reponse := User{ID: user.ID, CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt, Email: user.Email}
 	respondWithJSON(w, 201, reponse)
@@ -187,4 +204,66 @@ func validateChirp(chirp string) bool {
 		return false
 	}
 	return true
+}
+
+func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, r *http.Request) {
+	posts, err := cfg.db.GetAllPosts(r.Context())
+	if err != nil {
+		respondWithError(w, 500, "Error getting chirps from database")
+		return
+	}
+	response := make([]Post, len(posts))
+	for i, post := range posts {
+		response[i] = Post{ID: post.ID, CreatedAt: post.CreatedAt, UpdatedAt: post.UpdatedAt, Body: post.Body, UserID: post.UserID}
+	}
+	respondWithJSON(w, 200, response)
+
+}
+
+func (cfg *apiConfig) getChirpHandler(w http.ResponseWriter, r *http.Request) {
+	id_string := r.PathValue("id")
+	id, err := uuid.Parse(id_string)
+	if err != nil {
+		respondWithError(w, 500, "Error parsing id")
+		return
+	}
+	post, err := cfg.db.GetPostById(r.Context(), id)
+	if err != nil {
+		respondWithError(w, 404, "Error getting chirp")
+		return
+	}
+
+	response := Post{ID: post.ID, CreatedAt: post.CreatedAt, UpdatedAt: post.UpdatedAt, Body: post.Body, UserID: post.UserID}
+	respondWithJSON(w, 200, response)
+}
+
+func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request) {
+	type requestParams struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	params := &requestParams{}
+	err := decoder.Decode(params)
+	if err != nil {
+		respondWithError(w, 500, "Error decoding json")
+		return
+	}
+	user, err := cfg.db.GetUserByEmail(r.Context(), params.Email)
+	if err != nil {
+		respondWithError(w, 401, "Incorrect email or password")
+		return
+	}
+	match, err := auth.CheckPasswordHash(params.Password, user.HashedPassword)
+	if err != nil {
+		respondWithError(w, 401, err.Error())
+		return
+	}
+	if !match {
+		respondWithError(w, 401, "Incorrect email or password")
+		return
+	}
+
+	response := User{ID: user.ID, CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt, Email: user.Email}
+	respondWithJSON(w, 200, response)
 }
